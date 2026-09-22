@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Build, logs and caches
+*.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Runtime assets downloaded/generated locally
+models/
+
+# Se copiar o roteiro para dentro de app/, não versionar
+README-U1A3.md

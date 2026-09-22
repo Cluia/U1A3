@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Acesso Protegido</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .login-wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 420px;
+    }
+    .login-help {
+      color: var(--text-muted);
+      font-size: .9rem;
+      line-height: 1.5;
+      margin-bottom: 1rem;
+    }
+    .login-error {
+      color: #ff8585;
+      margin-bottom: .8rem;
+      font-size: .9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="card login-card">
+      <div class="card-title">🔐 Acesso Protegido</div>
+      <p class="login-help">
+        Esta instância exige autenticação para evitar uso não autorizado das requisições da OpenAI.
+      </p>
+
+      {% if error %}
+      <div class="login-error">{{ error }}</div>
+      {% endif %}
+
+      <form method="post" action="/login?next={{ next_url }}">
+        <div class="form-group">
+          <label for="password" class="form-label">Senha de acesso</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            class="form-control"
+            autocomplete="current-password"
+            required>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block">Entrar</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

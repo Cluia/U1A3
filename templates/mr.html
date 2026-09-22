@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Captura MR – Câmera → VR</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="/static/vendor/socket.io.min.js"></script>
+</head>
+<body class="mr-page">
+
+<nav class="navbar">
+  <div class="navbar-brand">📱 Captura MR</div>
+  <div class="navbar-links">
+    <a href="/">Início</a>
+    <a href="/mr" class="active">Captura MR</a>
+    <a href="/arvr">AR/VR</a>
+    <a href="/cv">CV</a>
+  </div>
+  <div id="wsStatus" class="status-badge">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Desconectado</span>
+  </div>
+</nav>
+
+<main class="mr-main">
+  <section class="card mr-instructions">
+    <div class="card-title">🎯 Fluxo da aula</div>
+    <ol class="mr-steps">
+      <li>No <strong>PC ou headset</strong>, abra a visualização VR:
+        <a id="arvrLink" href="/arvr" target="_blank" rel="noopener">/arvr</a>
+        <button type="button" class="btn btn-outline btn-sm" id="btnCopyArvr">Copiar URL</button>
+      </li>
+      <li>Neste dispositivo (celular/webcam), inicie a câmera abaixo.</li>
+      <li>Os rostos detectados viram avatares na cena em tempo real.</li>
+    </ol>
+    <p class="mr-hint">Use a mesma rede Wi‑Fi. No celular, a URL do servidor é <code id="serverOrigin">—</code></p>
+  </section>
+
+  <section class="mr-preview card">
+    <div class="card-title">📷 Detecção (preview)</div>
+    <div class="mr-video-box">
+      <video id="webcamVideo" autoplay playsinline muted style="display:none"></video>
+      <canvas id="captureCanvas" style="display:none"></canvas>
+      <img id="resultImg" style="display:none" alt="rostos detectados">
+      <div class="no-signal" id="noSignal">
+        <span style="font-size:2rem">📷</span>
+        <span>Toque em Iniciar câmera</span>
+      </div>
+      <div class="fps-badge" id="fpsBadge" style="display:none">0 fps</div>
+    </div>
+    <div class="mr-stats">
+      <span id="faceCountStat">Rostos: —</span>
+      <span id="vrTrackStat">Na cena VR: —</span>
+    </div>
+    <div class="flex gap-1" style="margin-top:.6rem">
+      <button class="btn btn-success" id="btnStartCam" type="button">▶ Iniciar câmera</button>
+      <button class="btn btn-danger" id="btnStopCam" type="button" disabled>⏹ Parar</button>
+    </div>
+    <div class="flex gap-1" style="align-items:center;margin-top:.5rem">
+      <label class="form-label" style="margin:0">FPS</label>
+      <input type="range" id="fpsRange" min="1" max="12" value="6" style="flex:1">
+      <span id="fpsVal" style="font-size:.8rem;min-width:20px">6</span>
+    </div>
+  </section>
+
+  <section class="card mr-calib">
+    <div class="card-title">📐 Calibração (mapeamento 2D → 3D)</div>
+    <p class="mr-hint">Ajuste se os avatares ficarem muito à esquerda/direita, altos/baixos ou longe/perto.</p>
+    <div class="mr-calib-grid" id="calibSliders"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-title">📜 Log</div>
+    <div class="log-panel" id="logPanel"></div>
+  </section>
+</main>
+
+<script src="/static/js/mr.js"></script>
+</body>
+</html>

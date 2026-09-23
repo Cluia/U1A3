@@ -10,13 +10,22 @@ Este servidor fornece:
 """
 
 import base64
+import binascii
 import hmac
 import io
+import ipaddress
 import json
 import logging
+import mimetypes
 import os
+import socket
 import time
-from datetime import timedelta
+
+# Windows: .js costuma ser text/plain → módulos ES (cv3d) não carregam
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,6 +34,8 @@ from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python import BaseOptions as MpBaseOptions
 from flask import Flask, redirect, render_template, request, session, url_for
 from flask_socketio import SocketIO, emit, join_room, leave_room
+
+import face_registry
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -168,8 +179,9 @@ connected_clients = {"arvr": 0, "cv": 0, "cv3d": 0, "worldgen": 0, "mr": 0}
 # ---------------------------------------------------------------------------
 # Realidade Mista — tracks de rostos → sala ARVR
 # ---------------------------------------------------------------------------
-MR_TRACK_TTL_SEC = 0.5
-MR_MATCH_DIST = 0.12  # distância normalizada (nx, ny) para manter o mesmo ID
+MR_TRACK_TTL_SEC = 1.5  # tempo sem match antes de remover o track
+MR_MATCH_DIST = 0.38  # distância normalizada (nx, ny) — Haar oscila bastante entre frames
+MR_POSITION_SMOOTH = 0.45  # EMA em nx/ny para estabilizar posição
 
 # Calibração grossa 2D→3D (ajustável pela página /mr)
 mr_calibration = {
@@ -194,6 +206,213 @@ MR_CALIB_LIMITS = {
 
 mr_tracks = {}  # track_id -> dados do track
 mr_next_track_num = 1
+
+
+def _decode_cv_image(image_b64: str):
+    if not image_b64 or not str(image_b64).strip():
+        return None
+    header, encoded = image_b64.split(",", 1) if "," in image_b64 else ("", image_b64)
+    if not encoded.strip():
+        return None
+    try:
+        img_bytes = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if not img_bytes:
+        return None
+    np_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    if np_arr.size == 0:
+        return None
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    return frame
+
+
+def _detect_faces_haar(frame: np.ndarray) -> list:
+    """Detecta rostos (Haar) e retorna lista com bbox, centro e coordenadas normalizadas."""
+    h_img, w_img = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    raw = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.15, minNeighbors=6, minSize=(48, 48)
+    )
+    faces = []
+    for i, (x, y, w, h) in enumerate(raw):
+        cx = int(x + w / 2)
+        cy = int(y + h / 2)
+        faces.append({
+            "id": f"face-{i}",
+            "x": int(x),
+            "y": int(y),
+            "w": int(w),
+            "h": int(h),
+            "cx": cx,
+            "cy": cy,
+            "nx": round(cx / w_img, 4),
+            "ny": round(cy / h_img, 4),
+        })
+    return faces
+
+
+def _apply_face_recognition(frame: np.ndarray, faces: list) -> None:
+    for face in faces:
+        try:
+            name, confidence = face_registry.recognize(frame, face)
+            if name:
+                face["recognition_name"] = name
+                face["recognition_confidence"] = confidence
+        except Exception as exc:
+            logger.debug("Reconhecimento facial: %s", exc)
+
+
+def _draw_faces_on_frame(frame: np.ndarray, faces: list) -> np.ndarray:
+    """Desenha retângulos, IDs e centro dos rostos no frame."""
+    result = frame.copy()
+    for idx, face in enumerate(faces):
+        x, y, w, h = face["x"], face["y"], face["w"], face["h"]
+        cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        caption = face.get("recognition_name") or f"Pessoa {idx + 1}"
+        cv2.putText(
+            result,
+            str(caption),
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 120) if face.get("recognition_name") else (255, 0, 0),
+            2,
+        )
+        cv2.circle(result, (face["cx"], face["cy"]), 4, (0, 255, 255), -1)
+    return result
+
+
+def _mr_calibration_snapshot() -> dict:
+    return {k: round(float(v), 3) for k, v in mr_calibration.items()}
+
+
+def _merge_mr_calibration(data: dict) -> dict:
+    """Mescla payload do cliente com limites seguros."""
+    for key, (lo, hi) in MR_CALIB_LIMITS.items():
+        if key not in data:
+            continue
+        try:
+            val = float(data[key])
+        except (TypeError, ValueError):
+            continue
+        mr_calibration[key] = max(lo, min(hi, val))
+    return _mr_calibration_snapshot()
+
+
+def _face_bbox_to_world(face: dict, img_w: int, img_h: int) -> tuple:
+    """Mapeia centro do rosto (pixels) para posição 3D — alinhado a cv3d.js pixelToWorld."""
+    cal = mr_calibration
+    cx, cy = face["cx"], face["cy"]
+    x = (cx / img_w - 0.5) * 2 * cal["range_x"]
+    y = (0.5 - cy / img_h) * 2 * cal["range_y"] + cal["base_y"]
+    z = -(face["w"] / img_w) * cal["z_scale"] + cal["z_offset"]
+    scale = max((face["w"] / img_w) * cal["scale_factor"], cal["scale_min"])
+    position = {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3)}
+    return position, round(scale, 3)
+
+
+def _update_mr_tracks_from_faces(faces: list, img_w: int, img_h: int) -> list:
+    """Atualiza estado global de tracks e faz matching por proximidade (nx, ny)."""
+    global mr_next_track_num
+
+    now = time.time()
+    matched_ids = set()
+    available_ids = set(mr_tracks.keys())
+
+    for face in faces:
+        nx, ny = face["nx"], face["ny"]
+        best_id = None
+        best_dist = MR_MATCH_DIST
+
+        for tid in available_ids:
+            track = mr_tracks[tid]
+            dx = track.get("nx", 0) - nx
+            dy = track.get("ny", 0) - ny
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tid
+
+        if best_id is None and len(faces) == 1:
+            stale = [t for t in mr_tracks if t not in matched_ids]
+            if len(stale) == 1:
+                best_id = stale[0]
+            elif stale:
+                best_id = max(stale, key=lambda t: mr_tracks[t]["updated_at"])
+
+        if best_id is None:
+            best_id = f"track-{mr_next_track_num}"
+            mr_next_track_num += 1
+        else:
+            available_ids.discard(best_id)
+
+        matched_ids.add(best_id)
+        prev = mr_tracks.get(best_id)
+        if prev:
+            a = MR_POSITION_SMOOTH
+            nx = round(a * face["nx"] + (1 - a) * prev.get("nx", face["nx"]), 4)
+            ny = round(a * face["ny"] + (1 - a) * prev.get("ny", face["ny"]), 4)
+            face = {**face, "nx": nx, "ny": ny, "cx": int(nx * img_w), "cy": int(ny * img_h)}
+
+        position, scale = _face_bbox_to_world(face, img_w, img_h)
+        person_num = best_id.split("-")[-1]
+        default_label = f"Pessoa {person_num}"
+        recognized = face.get("recognition_name")
+        if recognized:
+            display_name = recognized
+        elif prev and prev.get("recognition_name"):
+            display_name = prev["recognition_name"]
+        else:
+            display_name = None
+        label = display_name or default_label
+        mr_tracks[best_id] = {
+            "id": best_id,
+            "label": label,
+            "recognition_name": recognized or (prev.get("recognition_name") if prev else None),
+            "face_id": face["id"],
+            "nx": face["nx"],
+            "ny": face["ny"],
+            "cx": face["cx"],
+            "cy": face["cy"],
+            "w": face["w"],
+            "h": face["h"],
+            "position": position,
+            "scale": scale,
+            "updated_at": now,
+        }
+
+    for tid in list(mr_tracks.keys()):
+        if tid not in matched_ids and now - mr_tracks[tid]["updated_at"] > MR_TRACK_TTL_SEC:
+            del mr_tracks[tid]
+
+    return [mr_tracks[tid] for tid in matched_ids if tid in mr_tracks]
+
+
+def _mr_tracks_payload(img_w: int = 0, img_h: int = 0) -> dict:
+    tracks = list(mr_tracks.values())
+    payload = {
+        "tracks": tracks,
+        "timestamp": time.time(),
+    }
+    if img_w and img_h:
+        payload["frame_size"] = {"width": int(img_w), "height": int(img_h)}
+    elif tracks:
+        payload["frame_size"] = {"width": 640, "height": 480}
+    else:
+        payload["frame_size"] = {"width": 0, "height": 0}
+    return payload
+
+
+def _broadcast_mr_tracks(img_w: int, img_h: int, tracks: list):
+    payload = _mr_tracks_payload(img_w, img_h)
+    payload["tracks"] = tracks
+    socketio.emit("mr_tracks_update", payload, to="arvr")
+    socketio.emit("mr_tracks_update", payload, to="mr")
+
 
 # ---------------------------------------------------------------------------
 # OpenAI – AI World Generator
@@ -802,6 +1021,7 @@ def on_join_mr():
     emit("mr_ready", {
         "message": "Canal MR pronto. Envie frames com mr_face_frame.",
         "calibration": _mr_calibration_snapshot(),
+        "face_registry": face_registry.list_summary(),
     })
     emit("mr_tracks_update", _mr_tracks_payload())
     emit("mr_calibration_update", {"calibration": _mr_calibration_snapshot()})
@@ -830,6 +1050,7 @@ def on_mr_face_frame(data):
 
         h_img, w_img = frame.shape[:2]
         face_rects = _detect_faces_haar(frame)
+        _apply_face_recognition(frame, face_rects)
         result_frame = _draw_faces_on_frame(frame, face_rects)
         tracks = _update_mr_tracks_from_faces(face_rects, w_img, h_img)
         _broadcast_mr_tracks(w_img, h_img, tracks)
@@ -854,6 +1075,56 @@ def on_mr_face_frame(data):
     except Exception as exc:
         logger.exception("Erro no pipeline MR: %s", exc)
         emit("mr_face_result", {"error": str(exc)})
+
+
+@socketio.on("mr_enroll_face")
+def on_mr_enroll_face(data):
+    """Cadastra amostra facial (webcam ou upload) com um nome."""
+    name = (data or {}).get("name", "")
+    image_b64 = (data or {}).get("image", "")
+    try:
+        if not str(name or "").strip():
+            emit("mr_enroll_result", {"ok": False, "error": "Informe um nome."})
+            return
+        frame = _decode_cv_image(image_b64)
+        if frame is None:
+            emit("mr_enroll_result", {
+                "ok": False,
+                "error": "Imagem vazia ou inválida. Use JPG ou PNG com rosto visível.",
+            })
+            return
+        result = face_registry.enroll(frame, name)
+        emit("mr_enroll_result", result)
+        if result.get("ok"):
+            socketio.emit(
+                "mr_face_registry_update",
+                {"registry": face_registry.list_summary()},
+                to="mr",
+            )
+    except Exception as exc:
+        logger.exception("Erro ao cadastrar rosto: %s", exc)
+        msg = str(exc)
+        if "imdecode" in msg or "buf.empty" in msg:
+            msg = "Não foi possível ler a imagem. Envie JPG/PNG (evite HEIC se falhar)."
+        emit("mr_enroll_result", {"ok": False, "error": msg})
+
+
+@socketio.on("mr_clear_face_registry")
+def on_mr_clear_face_registry(data):
+    """Remove cadastros faciais (todos ou uma pessoa por nome)."""
+    name = (data or {}).get("name")
+    try:
+        result = face_registry.clear_registry(name.strip() if name else None)
+        emit("mr_clear_registry_result", result)
+        if result.get("ok"):
+            socketio.emit(
+                "mr_face_registry_update",
+                {"registry": face_registry.list_summary()},
+                to="mr",
+            )
+    except Exception as exc:
+        logger.exception("Erro ao limpar cadastro facial: %s", exc)
+        emit("mr_clear_registry_result", {"ok": False, "error": str(exc)})
 
 
 @socketio.on("mr_set_calibration")
@@ -906,165 +1177,6 @@ def on_cv_frame(data):
     except Exception as exc:
         logger.exception("Erro no pipeline de CV: %s", exc)
         emit("cv_result", {"error": str(exc)})
-
-
-def _detect_faces_haar(frame: np.ndarray) -> list:
-    """Detecta rostos (Haar) e retorna lista com bbox, centro e coordenadas normalizadas."""
-    h_img, w_img = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    raw = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
-    )
-    faces = []
-    for i, (x, y, w, h) in enumerate(raw):
-        cx = int(x + w / 2)
-        cy = int(y + h / 2)
-        faces.append({
-            "id": f"face-{i}",
-            "x": int(x),
-            "y": int(y),
-            "w": int(w),
-            "h": int(h),
-            "cx": cx,
-            "cy": cy,
-            "nx": round(cx / w_img, 4),
-            "ny": round(cy / h_img, 4),
-        })
-    return faces
-
-
-def _draw_faces_on_frame(frame: np.ndarray, faces: list) -> np.ndarray:
-    """Desenha retângulos, IDs e centro dos rostos no frame."""
-    result = frame.copy()
-    for face in faces:
-        x, y, w, h = face["x"], face["y"], face["w"], face["h"]
-        cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv2.putText(
-            result,
-            face.get("id", "Rosto"),
-            (x, y - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 0, 0),
-            2,
-        )
-        cv2.circle(result, (face["cx"], face["cy"]), 4, (0, 255, 255), -1)
-    return result
-
-
-def _mr_calibration_snapshot() -> dict:
-    return {k: round(float(v), 3) for k, v in mr_calibration.items()}
-
-
-def _merge_mr_calibration(data: dict) -> dict:
-    """Mescla payload do cliente com limites seguros."""
-    for key, (lo, hi) in MR_CALIB_LIMITS.items():
-        if key not in data:
-            continue
-        try:
-            val = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        mr_calibration[key] = max(lo, min(hi, val))
-    return _mr_calibration_snapshot()
-
-
-def _face_bbox_to_world(face: dict, img_w: int, img_h: int) -> tuple:
-    """Mapeia centro do rosto (pixels) para posição 3D — alinhado a cv3d.js pixelToWorld."""
-    cal = mr_calibration
-    cx, cy = face["cx"], face["cy"]
-    x = (cx / img_w - 0.5) * 2 * cal["range_x"]
-    y = (0.5 - cy / img_h) * 2 * cal["range_y"] + cal["base_y"]
-    z = -(face["w"] / img_w) * cal["z_scale"] + cal["z_offset"]
-    scale = max((face["w"] / img_w) * cal["scale_factor"], cal["scale_min"])
-    position = {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3)}
-    return position, round(scale, 3)
-
-
-def _update_mr_tracks_from_faces(faces: list, img_w: int, img_h: int) -> list:
-    """Atualiza estado global de tracks e faz matching simples por proximidade (nx, ny)."""
-    global mr_next_track_num
-
-    now = time.time()
-    matched_ids = set()
-
-    for face in faces:
-        nx, ny = face["nx"], face["ny"]
-        best_id = None
-        best_dist = MR_MATCH_DIST
-
-        for tid, track in mr_tracks.items():
-            if tid in matched_ids:
-                continue
-            if now - track["updated_at"] > MR_TRACK_TTL_SEC:
-                continue
-            dx = track.get("nx", 0) - nx
-            dy = track.get("ny", 0) - ny
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
-                best_id = tid
-
-        if best_id is None:
-            best_id = f"track-{mr_next_track_num}"
-            mr_next_track_num += 1
-
-        matched_ids.add(best_id)
-        position, scale = _face_bbox_to_world(face, img_w, img_h)
-        person_num = best_id.split("-")[-1]
-        mr_tracks[best_id] = {
-            "id": best_id,
-            "label": f"Pessoa {person_num}",
-            "face_id": face["id"],
-            "nx": face["nx"],
-            "ny": face["ny"],
-            "cx": face["cx"],
-            "cy": face["cy"],
-            "w": face["w"],
-            "h": face["h"],
-            "position": position,
-            "scale": scale,
-            "updated_at": now,
-        }
-
-    for tid in list(mr_tracks.keys()):
-        if now - mr_tracks[tid]["updated_at"] > MR_TRACK_TTL_SEC:
-            del mr_tracks[tid]
-
-    return list(mr_tracks.values())
-
-
-def _mr_tracks_payload(img_w: int = 0, img_h: int = 0) -> dict:
-    tracks = list(mr_tracks.values())
-    payload = {
-        "tracks": tracks,
-        "timestamp": time.time(),
-    }
-    if img_w and img_h:
-        payload["frame_size"] = {"width": int(img_w), "height": int(img_h)}
-    elif tracks:
-        payload["frame_size"] = {"width": 640, "height": 480}
-    else:
-        payload["frame_size"] = {"width": 0, "height": 0}
-    return payload
-
-
-def _broadcast_mr_tracks(img_w: int, img_h: int, tracks: list):
-    payload = _mr_tracks_payload(img_w, img_h)
-    payload["tracks"] = tracks
-    socketio.emit("mr_tracks_update", payload, to="arvr")
-    socketio.emit("mr_tracks_update", payload, to="mr")
-
-
-def _decode_cv_image(image_b64: str):
-    header, encoded = image_b64.split(",", 1) if "," in image_b64 else ("", image_b64)
-    img_bytes = base64.b64decode(encoded)
-    np_arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    return frame
 
 
 def _apply_pipeline(frame: np.ndarray, pipeline: str):
@@ -1581,6 +1693,87 @@ def on_worldgen_share(data):
 
 
 # ---------------------------------------------------------------------------
+# HTTPS de desenvolvimento (eventlet usa certfile/keyfile, não ssl_context)
+# ---------------------------------------------------------------------------
+
+def _local_ipv4() -> str | None:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return None
+
+
+def _ensure_dev_ssl_certificates() -> tuple[str, str]:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    cert_dir = Path(__file__).resolve().parent / "dev_ssl"
+    cert_dir.mkdir(exist_ok=True)
+    cert_path = cert_dir / "cert.pem"
+    key_path = cert_dir / "key.pem"
+    if cert_path.is_file() and key_path.is_file():
+        return str(cert_path), str(key_path)
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    alt_names: list[x509.GeneralName] = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+    ]
+    lan_ip = _local_ipv4()
+    if lan_ip:
+        try:
+            alt_names.append(x509.IPAddress(ipaddress.IPv4Address(lan_ip)))
+        except ValueError:
+            pass
+
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=825))
+        .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    key_path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    logger.info("Certificado HTTPS de desenvolvimento criado em %s", cert_dir)
+    return str(cert_path), str(key_path)
+
+
+def _resolve_ssl_cert_key() -> tuple[str, str]:
+    cert_file = os.environ.get("SSL_CERTFILE", "").strip()
+    key_file = os.environ.get("SSL_KEYFILE", "").strip()
+    if cert_file and key_file:
+        return cert_file, key_file
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "USE_HTTPS=true requer cryptography (pip install cryptography) "
+            "ou defina SSL_CERTFILE e SSL_KEYFILE."
+        ) from None
+    return _ensure_dev_ssl_certificates()
+
+
+# ---------------------------------------------------------------------------
 # Ponto de entrada
 # ---------------------------------------------------------------------------
 
@@ -1595,7 +1788,22 @@ if __name__ == "__main__":
     if not debug and app.config["SECRET_KEY"] == "arvrcv-base-server-secret":
         raise RuntimeError("FLASK_SECRET_KEY é obrigatória quando DEBUG=false.")
 
-    print(f"  Acesse: http://localhost:{port}")
+    use_https = os.environ.get("USE_HTTPS", "").lower() in {"1", "true", "yes", "on"}
+    run_kwargs: dict = {"host": "0.0.0.0", "port": port, "debug": debug}
+    scheme = "http"
+    if use_https:
+        certfile, keyfile = _resolve_ssl_cert_key()
+        run_kwargs["certfile"] = certfile
+        run_kwargs["keyfile"] = keyfile
+        scheme = "https"
+
+    print(f"  Acesse: {scheme}://localhost:{port}")
+    if use_https:
+        lan = _local_ipv4() or "<IP-do-PC>"
+        print(f"  Celular (câmera): {scheme}://{lan}:{port}/mr")
+        print("  (Aceite o certificado autoassinado — necessário para getUserMedia.)")
+    else:
+        print("  Celular (só leitura): http://<IP-do-PC>:{0}/mr — câmera no celular exige USE_HTTPS=true".format(port))
     if _auth_enabled():
         print("  Auth: ativa (login por senha compartilhada)")
         if app.config["SECRET_KEY"] == "arvrcv-base-server-secret":
@@ -1603,4 +1811,6 @@ if __name__ == "__main__":
     else:
         print("  Auth: desativada (APP_ACCESS_PASSWORD vazia)")
     print("=" * 60)
-    socketio.run(app, host="0.0.0.0", port=port, debug=debug)
+    face_registry.rebuild_recognizer()
+    # Eventlet + reloader no Windows costuma falhar ao bindar a porta (WinError 10048).
+    socketio.run(app, **run_kwargs, use_reloader=False)

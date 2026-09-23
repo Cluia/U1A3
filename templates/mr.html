@@ -31,10 +31,15 @@
         <a id="arvrLink" href="/arvr" target="_blank" rel="noopener">/arvr</a>
         <button type="button" class="btn btn-outline btn-sm" id="btnCopyArvr">Copiar URL</button>
       </li>
-      <li>Neste dispositivo (celular/webcam), inicie a câmera abaixo.</li>
+      <li>Nesta aba (webcam do PC em <code>localhost</code>), inicie a câmera abaixo.</li>
       <li>Os rostos detectados viram avatares na cena em tempo real.</li>
     </ol>
-    <p class="mr-hint">Use a mesma rede Wi‑Fi. No celular, a URL do servidor é <code id="serverOrigin">—</code></p>
+    <p class="mr-hint" id="pcHint">No PC use <code>http://localhost:5000</code> — HTTPS não é necessário.</p>
+    <p class="mr-hint" id="mobileHint" style="display:none">Celular na mesma Wi‑Fi: <code id="serverOrigin">—</code></p>
+    <p class="mr-hint" id="httpsHint" style="display:none">
+      <strong>Câmera no celular:</strong> use <code>https://</code> (não <code>http://</code>).
+      No PC: <code>$env:USE_HTTPS=&quot;true&quot;; python server.py</code> e aceite o certificado no navegador.
+    </p>
   </section>
 
   <section class="mr-preview card">
@@ -62,6 +67,25 @@
       <input type="range" id="fpsRange" min="1" max="12" value="6" style="flex:1">
       <span id="fpsVal" style="font-size:.8rem;min-width:20px">6</span>
     </div>
+  </section>
+
+  <section class="card mr-enroll">
+    <div class="card-title">🧠 Reconhecimento facial (cadastro)</div>
+    <p class="mr-hint">
+      <strong>1)</strong> Digite o nome &nbsp; <strong>2)</strong> Envie <strong>3–8 fotos</strong> (botão Fotos) <em>ou</em> use a webcam (Cadastrar frame).
+      Rostos de frente, luz parecida com o uso. Nome no preview (verde) e no avatar em <code>/arvr</code>.
+    </p>
+    <div class="flex gap-1" style="flex-wrap:wrap;align-items:center">
+      <input type="text" id="enrollName" class="form-input" placeholder="Seu nome" maxlength="40" style="flex:1;min-width:140px">
+      <label class="btn btn-primary btn-sm" style="cursor:pointer;margin:0">
+        📁 Fotos (upload)
+        <input type="file" id="enrollFiles" accept="image/jpeg,image/png,image/webp,image/*" multiple hidden>
+      </label>
+      <button type="button" class="btn btn-outline btn-sm" id="btnEnrollFrame" disabled>Cadastrar frame (webcam)</button>
+      <button type="button" class="btn btn-outline btn-sm btn-danger" id="btnClearRegistry">Limpar cadastros</button>
+    </div>
+    <p class="mr-hint" id="enrollStatus" style="margin-top:.4rem;font-size:.8rem"></p>
+    <ul id="registryList" class="mr-registry-list" style="margin-top:.6rem;font-size:.85rem;color:var(--text-muted)"></ul>
   </section>
 
   <section class="card mr-calib">

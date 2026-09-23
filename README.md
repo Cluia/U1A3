@@ -21,17 +21,55 @@ python server.py
 | Windows | `.\venv\Scripts\activate` |
 | Linux / macOS | `source venv/bin/activate` |
 
-Acesse **http://localhost:5000**. Para demo com celular: `http://<IP-do-PC>:5000/mr`.
+Acesse **http://localhost:5000** — **não** defina `USE_HTTPS` se for usar só no PC.
 
 ---
 
-## Fluxo recomendado (U1A3)
+## Uso somente no PC (recomendado)
 
-1. **`/arvr`** no PC ou headset — visualizar a sala virtual.  
-2. **`/mr`** no celular — **Iniciar câmera** (transmissão automática de rostos).  
-3. Ajuste os **sliders de calibração** em `/mr` se os avatares ficarem deslocados.
+A webcam funciona em **`http://localhost`** sem certificado. Dois jeitos de testar:
 
-Alternativa: **`/cv`** → pipeline *Detecção de Rostos* → marcar *Transmitir rostos para VR*.
+**Opção A — Captura MR**
+
+1. Abra **duas abas** no navegador (Chrome ou Edge):
+   - [http://localhost:5000/arvr](http://localhost:5000/arvr) — sala virtual  
+   - [http://localhost:5000/mr](http://localhost:5000/mr) — **Iniciar câmera** (webcam do PC)
+2. Ajuste os **sliders de calibração** em `/mr` se os avatares ficarem deslocados.
+
+**Reconhecimento (nome no VR):** em `/mr` → *Reconhecimento facial*:
+
+1. Digite o **nome** (ex.: seu nome).
+2. **Upload:** botão *Fotos* — selecione 3–8 imagens (JPG/PNG), rosto de frente e bem visível.
+3. **Webcam:** inicie a câmera e use *Cadastrar frame* várias vezes com pequenas variações de ângulo.
+4. Abra `/arvr` — o texto acima do avatar deve mostrar o **nome** (verde no preview quando reconhecido).
+
+Dados em `face_registry/` (local, não versionado). *Limpar cadastros* remove tudo; com nome no campo, remove só essa pessoa.
+
+**Opção B — Laboratório CV**
+
+1. Aba [http://localhost:5000/arvr](http://localhost:5000/arvr)  
+2. Aba [http://localhost:5000/cv](http://localhost:5000/cv) → pipeline *Detecção de Rostos* → marque *Transmitir rostos para VR* → inicie a câmera.
+
+Se você tinha ativado HTTPS antes, desligue no PowerShell antes de subir o servidor:
+
+```powershell
+Remove-Item Env:USE_HTTPS -ErrorAction SilentlyContinue
+python server.py
+```
+
+<details>
+<summary>Câmera no celular (opcional)</summary>
+
+Exige **HTTPS** (`USE_HTTPS=true`) e aceitar certificado autoassinado em `https://<IP-do-PC>:5000/mr`.
+</details>
+
+---
+
+## Fluxo da atividade (referência)
+
+1. **`/arvr`** — visualizar a sala virtual.  
+2. **`/mr`** ou **`/cv`** — captura e detecção de rostos.  
+3. Calibração em `/mr` quando necessário.
 
 ---
 

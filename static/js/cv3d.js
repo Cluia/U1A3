@@ -10,12 +10,11 @@
  *   - threshold→ pontos binários
  */
 
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-
 /* ═══════════════════════════════════════════════════════════════════════
    Estado
    ═══════════════════════════════════════════════════════════════════════ */
+let THREE = null;
+let OrbitControls = null;
 let socket = null;
 let camStream = null;
 let captureTimer = null;
@@ -66,10 +65,14 @@ function escHtml(str) {
   return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-fpsRange.addEventListener("input", () => {
-  fpsVal.textContent = fpsRange.value;
-  if (captureTimer) restartCaptureLoop();
-});
+/** Socket.IO é carregado como script clássico; em módulos ES use globalThis.io. */
+function getSocketIo() {
+  const ioFn = globalThis.io;
+  if (typeof ioFn !== "function") {
+    return null;
+  }
+  return ioFn;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
    Three.js Scene Manager
@@ -77,10 +80,18 @@ fpsRange.addEventListener("input", () => {
 let scene, camera, renderer, controls, gridHelper, axesHelper;
 let cvGroup; // grupo para objetos gerados pelo CV (limpos a cada frame)
 
-function initThreeScene() {
+async function loadThreeModules() {
+  if (THREE && OrbitControls) return;
+  THREE = await import("three");
+  const ocMod = await import("three/addons/controls/OrbitControls.js");
+  OrbitControls = ocMod.OrbitControls;
+}
+
+async function initThreeScene() {
+  await loadThreeModules();
   const container = document.getElementById("threejsContainer");
-  const w = container.clientWidth;
-  const h = container.clientHeight;
+  const w = Math.max(container.clientWidth, 320);
+  const h = Math.max(container.clientHeight, 240);
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1a2e);
@@ -156,10 +167,12 @@ function initThreeScene() {
   ro.observe(container);
 
   animate();
+  log("Cena 3D iniciada.");
 }
 
 function animate() {
   requestAnimationFrame(animate);
+  if (!controls || !renderer || !scene || !camera) return;
   controls.update();
   renderer.render(scene, camera);
 }
@@ -177,6 +190,7 @@ const PIPELINE_COLORS = {
 };
 
 function clearCVGroup() {
+  if (!cvGroup) return;
   while (cvGroup.children.length > 0) {
     const child = cvGroup.children[0];
     cvGroup.remove(child);
@@ -202,6 +216,10 @@ function pixelToWorld(px, py, imgW, imgH, rangeX = 5, rangeY = 4, zBase = 0) {
 }
 
 function mapGeometry(geometry) {
+  if (!cvGroup || !THREE) {
+    log("Aguardando cena 3D (Three.js)…", "warning");
+    return 0;
+  }
   clearCVGroup();
 
   const { type, width, height } = geometry;
@@ -447,13 +465,46 @@ window.setPipeline = setPipeline;
 /* ═══════════════════════════════════════════════════════════════════════
    Câmera
    ═══════════════════════════════════════════════════════════════════════ */
+function cameraAccessBlockedReason() {
+  if (!window.isSecureContext) {
+    return (
+      "Câmera exige contexto seguro. No PC use http://localhost:5000/cv3d. " +
+      "No celular use https:// com certificado aceito."
+    );
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return "getUserMedia indisponível neste navegador.";
+  }
+  return null;
+}
+
+function formatCameraError(err) {
+  const name = err?.name || "";
+  if (name === "NotReadableError" || name === "TrackStartError") {
+    return "Câmera em uso por outro app ou outra aba (/mr, /cv). Feche-as e tente de novo.";
+  }
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "Permissão da câmera negada. Libere no ícone de cadeado do navegador.";
+  }
+  if (name === "NotFoundError") {
+    return "Nenhuma webcam encontrada.";
+  }
+  return err?.message || String(err);
+}
+
 async function startCamera() {
+  const blocked = cameraAccessBlockedReason();
+  if (blocked) {
+    log(blocked, "error");
+    return;
+  }
   try {
     camStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480 },
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
     webcamVideo.srcObject = camStream;
+    await webcamVideo.play().catch(() => {});
     webcamVideo.style.display = "block";
     uploadedImg.style.display = "none";
     noSignal.style.display = "none";
@@ -461,9 +512,10 @@ async function startCamera() {
     btnStartCam.disabled = true;
     btnStopCam.disabled = false;
     log("Câmera iniciada.");
-    startCaptureLoop();
+    if (socket?.connected) startCaptureLoop();
+    else log("Aguardando WebSocket para processar frames…", "warning");
   } catch (err) {
-    log(`Erro ao acessar câmera: ${err.message}`, "error");
+    log(`Erro ao acessar câmera: ${formatCameraError(err)}`, "error");
   }
 }
 
@@ -566,6 +618,10 @@ window.toggleBroadcast = toggleBroadcast;
    Three.js helpers expostos
    ═══════════════════════════════════════════════════════════════════════ */
 function resetThreeCamera() {
+  if (!camera || !controls) {
+    log("Cena 3D não disponível.", "warning");
+    return;
+  }
   camera.position.set(0, 5, 12);
   controls.target.set(0, 1, 0);
   controls.update();
@@ -574,6 +630,7 @@ function resetThreeCamera() {
 window.resetThreeCamera = resetThreeCamera;
 
 function toggleGrid() {
+  if (!gridHelper || !axesHelper) return;
   gridVisible = !gridVisible;
   gridHelper.visible = gridVisible;
   axesHelper.visible = gridVisible;
@@ -585,19 +642,35 @@ window.toggleGrid = toggleGrid;
    Socket.IO
    ═══════════════════════════════════════════════════════════════════════ */
 function initSocket() {
-  socket = io({ transports: ["websocket"] });
+  const ioFn = getSocketIo();
+  if (!ioFn) {
+    log("Socket.IO não carregou (globalThis.io). Verifique /static/vendor/socket.io.min.js.", "error");
+    return;
+  }
+
+  socket = ioFn({
+    transports: ["websocket", "polling"],
+    path: "/socket.io",
+  });
 
   socket.on("connect", () => {
     statusDot.classList.add("connected");
     statusText.textContent = "Conectado";
     log("Conectado ao servidor WebSocket.");
     socket.emit("join_cv3d");
+    if (camStream && !captureTimer) startCaptureLoop();
   });
 
   socket.on("disconnect", () => {
     statusDot.classList.remove("connected");
     statusText.textContent = "Desconectado";
     log("Desconectado do servidor.", "warning");
+  });
+
+  socket.on("connect_error", (err) => {
+    statusDot.classList.remove("connected");
+    statusText.textContent = "Desconectado";
+    log(`Falha na conexão WebSocket: ${err?.message || err}`, "error");
   });
 
   socket.on("cv3d_ready", ({ message }) => {
@@ -690,7 +763,30 @@ function renderDetections(detections) {
 /* ═══════════════════════════════════════════════════════════════════════
    Init
    ═══════════════════════════════════════════════════════════════════════ */
+function bindUiHandlers() {
+  btnStartCam?.addEventListener("click", () => startCamera());
+  btnStopCam?.addEventListener("click", () => stopCamera());
+  document.getElementById("btnBroadcast")?.addEventListener("click", () => toggleBroadcast());
+  document.getElementById("fileInput")?.addEventListener("change", (e) => loadImageFile(e));
+  document.querySelectorAll(".pipeline-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setPipeline(btn));
+  });
+  document.getElementById("btnResetThreeCam")?.addEventListener("click", () => resetThreeCamera());
+  document.getElementById("btnToggleGrid")?.addEventListener("click", () => toggleGrid());
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  initThreeScene();
+  bindUiHandlers();
+  fpsRange?.addEventListener("input", () => {
+    if (fpsVal) fpsVal.textContent = fpsRange.value;
+    if (captureTimer) restartCaptureLoop();
+  });
   initSocket();
+  initThreeScene().catch((err) => {
+    console.error(err);
+    log(
+      `Falha ao iniciar cena 3D: ${err.message}. Verifique conexão com a internet (Three.js via CDN). Câmera e CV seguem ativos.`,
+      "error",
+    );
+  });
 });

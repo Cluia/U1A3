@@ -25,6 +25,8 @@ htmlcov/
 
 # Runtime assets downloaded/generated locally
 models/
+dev_ssl/
+face_registry/
 
 # Se copiar o roteiro para dentro de app/, não versionar
 README-U1A3.md

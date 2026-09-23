@@ -100,7 +100,7 @@ function getTrackContainer() {
 
 function upsertTrackEntity(track) {
   const domId = trackDomId(track.id);
-  let root = document.getElementById(domId);
+  let root = trackState[track.id] || document.getElementById(domId);
   const colorIdx = (parseInt(String(track.id).split("-").pop(), 10) || 1) % TRACK_COLORS.length;
   const color = TRACK_COLORS[colorIdx];
   const scale = track.scale || 1;

@@ -41,6 +41,15 @@ const calibSliders = document.getElementById("calibSliders");
 const arvrLink = document.getElementById("arvrLink");
 const serverOrigin = document.getElementById("serverOrigin");
 const btnCopyArvr = document.getElementById("btnCopyArvr");
+const enrollName = document.getElementById("enrollName");
+const btnEnrollFrame = document.getElementById("btnEnrollFrame");
+const enrollFiles = document.getElementById("enrollFiles");
+const registryList = document.getElementById("registryList");
+const enrollStatus = document.getElementById("enrollStatus");
+const btnClearRegistry = document.getElementById("btnClearRegistry");
+
+let enrollQueue = [];
+let enrollInFlight = false;
 
 function log(msg, type = "info") {
   const p = document.createElement("p");
@@ -99,7 +108,20 @@ function setupLinks() {
   const origin = window.location.origin;
   const arvrUrl = `${origin}/arvr`;
   if (arvrLink) arvrLink.href = arvrUrl;
-  if (serverOrigin) serverOrigin.textContent = origin;
+  const serverOriginEl = document.getElementById("serverOrigin");
+  const pcHint = document.getElementById("pcHint");
+  const mobileHint = document.getElementById("mobileHint");
+  const onLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+  if (onLocalhost) {
+    if (pcHint) pcHint.style.display = "block";
+    if (mobileHint) mobileHint.style.display = "none";
+  } else {
+    if (pcHint) pcHint.style.display = "none";
+    if (mobileHint) mobileHint.style.display = "block";
+    if (serverOriginEl) serverOriginEl.textContent = origin;
+  }
+  const httpsHint = document.getElementById("httpsHint");
+  if (httpsHint && !window.isSecureContext && !onLocalhost) httpsHint.style.display = "block";
   if (btnCopyArvr) {
     btnCopyArvr.addEventListener("click", async () => {
       try {
@@ -112,7 +134,32 @@ function setupLinks() {
   }
 }
 
+function cameraAccessBlockedReason() {
+  if (!window.isSecureContext) {
+    const host = window.location.host;
+    return (
+      "No celular a câmera só funciona em HTTPS (contexto seguro). " +
+      `Você está em ${window.location.protocol}//${host}. ` +
+      "No PC, reinicie o servidor com USE_HTTPS=true e abra https://" +
+      host.split(":")[0] +
+      "/mr (aceite o aviso de certificado no navegador)."
+    );
+  }
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+    return (
+      "getUserMedia indisponível neste navegador. Use Chrome ou Safari atualizado " +
+      "e, no celular, a URL deve ser https:// (não http:// pelo IP da rede)."
+    );
+  }
+  return null;
+}
+
 async function startCamera() {
+  const blocked = cameraAccessBlockedReason();
+  if (blocked) {
+    log(blocked, "error");
+    return;
+  }
   try {
     camStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
@@ -126,6 +173,7 @@ async function startCamera() {
     btnStartCam.disabled = true;
     btnStopCam.disabled = false;
     log("Câmera iniciada — transmitindo para /arvr.");
+    if (btnEnrollFrame) btnEnrollFrame.disabled = false;
     startCaptureLoop();
   } catch (err) {
     log(`Erro na câmera: ${err.message}`, "error");
@@ -145,7 +193,82 @@ function stopCamera() {
   fpsBadge.style.display = "none";
   btnStartCam.disabled = false;
   btnStopCam.disabled = true;
+  if (btnEnrollFrame) btnEnrollFrame.disabled = true;
   log("Câmera parada.");
+}
+
+function renderRegistryList(registry) {
+  if (!registryList) return;
+  const items = registry || [];
+  if (!items.length) {
+    registryList.innerHTML = "<li>Nenhum rosto cadastrado.</li>";
+    return;
+  }
+  registryList.innerHTML = items
+    .map((p) => `<li><strong>${p.name}</strong> — ${p.samples} foto(s)</li>`)
+    .join("");
+}
+
+function snapshotForEnroll() {
+  const ctx = captureCanvas.getContext("2d");
+  captureCanvas.width = webcamVideo.videoWidth || 640;
+  captureCanvas.height = webcamVideo.videoHeight || 480;
+  ctx.drawImage(webcamVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+  return captureCanvas.toDataURL("image/jpeg", 0.9);
+}
+
+function setEnrollStatus(text) {
+  if (enrollStatus) enrollStatus.textContent = text || "";
+}
+
+function drainEnrollQueue() {
+  if (enrollInFlight || enrollQueue.length === 0 || !socket?.connected) {
+    if (!enrollInFlight && enrollQueue.length === 0) setEnrollStatus("");
+    return;
+  }
+  const item = enrollQueue.shift();
+  enrollInFlight = true;
+  setEnrollStatus(`Enviando cadastro… (${enrollQueue.length} na fila)`);
+  socket.emit("mr_enroll_face", { name: item.name, image: item.image });
+}
+
+function enrollImage(dataUrl, name, label = "") {
+  if (!socket?.connected) {
+    log("Sem conexão com o servidor.", "error");
+    return;
+  }
+  if (!name?.trim()) {
+    log("Informe um nome antes de enviar fotos.", "warning");
+    return;
+  }
+  enrollQueue.push({ name: name.trim(), image: dataUrl, label });
+  drainEnrollQueue();
+}
+
+async function enrollFilesList(files, name) {
+  if (!files.length) return;
+  if (!name?.trim()) {
+    log("Digite o nome e depois escolha as fotos.", "warning");
+    return;
+  }
+  setEnrollStatus(`Preparando ${files.length} foto(s)…`);
+  for (const file of files) {
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      enrollImage(dataUrl, name, file.name);
+    } catch {
+      log(`Não foi possível ler ${file.name}.`, "error");
+    }
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 function startCaptureLoop() {
@@ -212,9 +335,34 @@ function initSocket() {
     log("Desconectado.", "warning");
   });
 
-  socket.on("mr_ready", ({ message, calibration: cal }) => {
+  socket.on("mr_ready", ({ message, calibration: cal, face_registry: reg }) => {
     log(message);
     if (cal) applyCalibrationToUI(cal);
+    renderRegistryList(reg);
+  });
+
+  socket.on("mr_face_registry_update", ({ registry }) => {
+    renderRegistryList(registry);
+  });
+
+  socket.on("mr_enroll_result", (res) => {
+    enrollInFlight = false;
+    if (res.ok) {
+      log(`Cadastro «${res.name}» — ${res.samples} amostra(s) no total.`);
+      renderRegistryList(res.registry);
+    } else {
+      log(res.error || "Falha no cadastro.", "error");
+    }
+    drainEnrollQueue();
+  });
+
+  socket.on("mr_clear_registry_result", (res) => {
+    if (res.ok) {
+      log(res.message || "Cadastros limpos.");
+      renderRegistryList(res.registry);
+    } else {
+      log(res.error || "Não foi possível limpar.", "error");
+    }
   });
 
   socket.on("mr_calibration_update", ({ calibration: cal }) => {
@@ -239,6 +387,46 @@ fpsRange.addEventListener("input", () => {
 
 btnStartCam.addEventListener("click", startCamera);
 btnStopCam.addEventListener("click", stopCamera);
+
+if (btnEnrollFrame) {
+  btnEnrollFrame.addEventListener("click", () => {
+    if (!camStream) {
+      log("Inicie a câmera antes de cadastrar.", "warning");
+      return;
+    }
+    enrollImage(snapshotForEnroll(), enrollName?.value);
+  });
+}
+
+if (enrollFiles) {
+  enrollFiles.addEventListener("click", (e) => {
+    if (!enrollName?.value?.trim()) {
+      e.preventDefault();
+      log("Digite o nome antes de escolher as fotos.", "warning");
+    }
+  });
+  enrollFiles.addEventListener("change", async () => {
+    const name = enrollName?.value?.trim();
+    const files = [...(enrollFiles.files || [])];
+    enrollFiles.value = "";
+    await enrollFilesList(files, name);
+  });
+}
+
+if (btnClearRegistry) {
+  btnClearRegistry.addEventListener("click", () => {
+    const name = enrollName?.value?.trim();
+    const msg = name
+      ? `Remover só o cadastro de «${name}»?`
+      : "Remover TODOS os rostos cadastrados?";
+    if (!window.confirm(msg)) return;
+    if (!socket?.connected) {
+      log("Sem conexão com o servidor.", "error");
+      return;
+    }
+    socket.emit("mr_clear_face_registry", name ? { name } : {});
+  });
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   buildCalibUI();
